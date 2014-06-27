@@ -73,6 +73,87 @@ void stream_remove(struct stream *s)
     free(s);
 }
 
+void handle_in(LIBSSH2_LISTENER *listener, struct mk_list *channels)
+{
+    int bytes;
+    struct mk_list *head;
+    struct mk_list *tmp;
+    struct stream *st;
+
+    LIBSSH2_CHANNEL *channel;
+
+    /* Check if we have a new channel request */
+    channel = libssh2_channel_forward_accept(listener);
+    if (channel) {
+        /* After accept the connection, register the Channel data */
+        st = malloc(sizeof(struct stream));
+        st->channel = channel;
+        mk_list_add(&st->_head, channels);
+
+        fprintf(stderr, "[+] new channel connection %p\n", channel);
+    }
+
+    /* Check if the incoming packet is for some active Channel */
+    mk_list_foreach_safe(head, tmp, channels) {
+        st = mk_list_entry(head, struct stream, _head);
+        bytes = libssh2_channel_read(st->channel,
+                                     st->buf,
+                                     sizeof(st->buf));
+
+        if (bytes == LIBSSH2_ERROR_EAGAIN || bytes == 0) {
+            continue;
+        }
+
+        if (bytes == LIBSSH2_ERROR_CHANNEL_CLOSED) {
+            stream_remove(st);
+            continue;
+        }
+        else if (bytes < 0) {
+            printf("CHANNEL CLOSED\n");
+            stream_remove(st);
+        }
+        else {
+            printf("[+] Channel %p READ %i bytes\n",
+                   st->channel, bytes);
+            st->buf[bytes] = '\0';
+
+            /* Test direct response */
+            int i;
+            int c;
+            char *b = "HTTP/1.0 200 OK\r\n"
+                "Connection: close\r\n"
+                "Content-Length: 10\r\n\r\n"
+                "abcd efgh\n";
+
+            c = 0;
+            bytes = strlen(b);
+            do {
+                i = libssh2_channel_write(st->channel,
+                                          b + c,
+                                          bytes - c);
+                if (i == LIBSSH2_ERROR_EAGAIN) {
+                    printf("wait to write\n");
+                    continue;
+                }
+
+                if (i < 0) {
+                    fprintf(stderr, "libssh2_channel_write: %d\n", i);
+                    stream_remove(st);
+                    st = NULL;
+                    break;
+                }
+                c += i;
+            } while (i > 0 && c < bytes);
+
+            printf("[+] Channel %p completed, sent %i/%i byte\n",
+                   st->channel, c, bytes);
+            if (st) {
+                stream_remove(st);
+            }
+        }
+    }
+}
+
 void session_loop(int server_fd, LIBSSH2_LISTENER *listener)
 {
 
@@ -81,14 +162,9 @@ void session_loop(int server_fd, LIBSSH2_LISTENER *listener)
     int efd;
     int ret;
     int num_fds;
-    int bytes;
     struct epoll_event event = {0, {0}};
     struct epoll_event *events;
     struct mk_list channels;
-    struct mk_list *head;
-    struct mk_list *tmp;
-    struct stream *st;
-    LIBSSH2_CHANNEL *channel;
 
     mk_list_init(&channels);
 
@@ -109,7 +185,10 @@ void session_loop(int server_fd, LIBSSH2_LISTENER *listener)
     fprintf(stderr, "Waiting for events...\n");
 
     while (1) {
-        num_fds = epoll_wait(efd, events, 32, -1);
+        num_fds = epoll_wait(efd, events, 32, 500);
+        if (num_fds <= 0){
+            goto timeout;
+        }
 
         for (i = 0; i < num_fds; i++) {
             fd = events[i].data.fd;
@@ -117,71 +196,7 @@ void session_loop(int server_fd, LIBSSH2_LISTENER *listener)
             if (events[i].events & EPOLLIN) {
                 /* Event on libssh2 Session socket */
                 if (fd == server_fd) {
-                    /* Check if we have a new channel request */
-                    channel = libssh2_channel_forward_accept(listener);
-                    if (channel) {
-                        /* After accept the connection, register the Channel data */
-                        st = malloc(sizeof(struct stream));
-                        st->channel = channel;
-                        mk_list_add(&st->_head, &channels);
-
-                        fprintf(stderr, "[+] new channel connection %p\n", channel);
-                    }
-
-                    /* Check if the incoming packet is for some active Channel */
-                    mk_list_foreach_safe(head, tmp, &channels) {
-                        st = mk_list_entry(head, struct stream, _head);
-                        bytes = libssh2_channel_read(st->channel,
-                                                     st->buf,
-                                                     sizeof(st->buf));
-
-                        if (bytes == LIBSSH2_ERROR_EAGAIN || bytes == 0) {
-                            continue;
-                        }
-
-                        if (bytes == LIBSSH2_ERROR_CHANNEL_CLOSED) {
-                            stream_remove(st);
-                            continue;
-                        }
-                        else if (bytes < 0) {
-                            printf("CHANNEL CLOSED\n");
-                            stream_remove(st);
-                        }
-                        else {
-                            printf("[+] Channel %p READ %i bytes\n",
-                                   st->channel, bytes);
-                            st->buf[bytes] = '\0';
-
-                            /* Test direct response */
-                            int i;
-                            int c;
-                            char *b = "HTTP/1.0 200 OK\r\n"
-                                     "Connection: close\r\n"
-                                     "Content-Length: 10\r\n\r\n"
-                                     "abcd efgh\n";
-
-                            c = 0;
-                            bytes = strlen(b);
-                            do {
-                                i = libssh2_channel_write(st->channel,
-                                                          b + c,
-                                                          bytes - c);
-                                if (i == LIBSSH2_ERROR_EAGAIN) {
-                                    continue;
-                                }
-
-                                if (i < 0) {
-                                    fprintf(stderr, "libssh2_channel_write: %d\n", i);
-                                    stream_remove(st);
-                                    break;
-                                }
-                                c += i;
-                            } while (i > 0 && c < bytes);
-                            printf("[+] Channel %p completed, sent %i/%i byte\n",
-                                   st->channel, c, bytes);
-                            stream_remove(st);
-                        }
-                    }
+                    handle_in(listener, &channels);
                 }
             }
             else { /* EPOLLERR | EPOLLRDHUP .. */
@@ -189,6 +204,15 @@ void session_loop(int server_fd, LIBSSH2_LISTENER *listener)
                 exit(1);
             }
         }
+
+        /*
+         * For some reason we need a timeout as some data can be enqueued
+         * but at the moment we process the channels list some data can be retrieved
+         * after we passed some lower channels ID
+         */
+    timeout:
+        handle_in(listener, &channels);
+
     }
 }
 
@@ -256,7 +280,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "Request forward => localhost:%i\n", remote_wantport);
     listener = libssh2_channel_forward_listen_ex(session, "localhost",
                                                  remote_wantport,
-                                                 &remote_listenport, 1);
+                                                 &remote_listenport, 64);
     if (!listener) {
         fprintf(stderr, "Could not create the listener\n");
         exit(EXIT_FAILURE);
